@@ -1,0 +1,192 @@
+#!/bin/bash
+# Mel - 2018-03-26 - find printers on our network and collect info about them
+
+outfile=/tmp/printers.csv
+if tty >/dev/null;then
+    liveuser="yes"
+fi
+zebratotal=0
+cd /tmp
+echo "Branch,Building,IP address,Serial #,MAC Address,Make,Model" >$outfile
+for oct3steps in $(seq 0 32 120);do
+    for oct2 in $(seq 0 99);do
+        for oct3 in $(seq $oct3steps 8 $((oct3steps+24)));do
+            if ping -w2 -c1 10.$oct2.$oct3.1 >/dev/null 2>&1;then
+                [[ -z $liveuser ]] || echo -en "Checking 10.$oct2.$oct3.X\t"
+                normalized="$(printf "%03d%03d" $oct2 $oct3)"
+                nmap -oG /tmp/zenmap.$normalized -p515,631,9100 10.$oct2.$oct3.2-254 >/dev/null 2>&1
+                [[ -z $liveuser ]] || echo -en "Found $(egrep 'Ports:.* (515|631|9100)/(open|filtered)' /tmp/zenmap.$normalized|wc -l) possibles\t"
+                zebracnt=0
+                for oneprinter in $(egrep 'Ports:.* (515|631|9100)/(open|filtered)' /tmp/zenmap.$normalized|awk '{print $2}');do
+                    [[ -f proutput2.$$ ]] && /bin/rm -f proutput2.$$
+                    found="no"
+                    prmake="Unknown"
+                    model="Unknown"
+                    serial="Unknown"
+                    macaddr="Unknown"
+                    # almost all network capable printers can do snmp
+                    sysname="$(snmpget -v 1 -Ov -OQ -c public $oneprinter .1.3.6.1.2.1.1.1.0 2>/dev/null)"
+                    snmperr=$?
+                    [[ $sysname =~ PortServer ]] && continue
+                    # did snmp fail?
+                    if [[ $snmperr -eq 0 ]];then
+
+                        # some printers have these in common, so start with this as the base
+                        #model="$(snmpget -v 1 -Ov -OQ -c public $oneprinter .1.3.6.1.2.1.1.1.0 2>/dev/null)"
+                        model="$(snmpget -v 1 -Ov -OQ -c public $oneprinter .1.3.6.1.2.1.25.3.2.1.3.1 2>/dev/null)"
+                        [[ $model =~ PortServer ]] && continue
+                        macaddr="$(snmpget -v 1 -Ov -OQ -c public $oneprinter .1.3.6.1.2.1.2.2.1.6.1 2>/dev/null)"
+                        macaddr="${macaddr//\"/}"
+                        # this really seems to be an HP specific thing, but seems general since HP snmp is more than a little broken
+                        macaddr="${macaddr//\"/}"
+                        serial="$(snmpget -v 1 -Ov -OQ -c public $oneprinter .1.3.6.1.2.1.43.5.1.1.17.1 2>/dev/null)"
+
+                        # generalize the make, and do specific adjustments for each make
+                        if [[ $sysname =~ RICOH ]] || [[ $sysname =~ Ricoh ]];then
+                            prmake="Ricoh"
+                            serial="$(snmpget -v 1 -Ov -OQ -c public $oneprinter .1.3.6.1.4.1.367.3.2.1.2.1.4.0 2>/dev/null)"
+                            found="yes"
+                        elif [[ $sysname =~ CANON ]] || [[ $sysname =~ Canon ]];then
+                            prmake="Canon"
+                            found="yes"
+                        elif [[ $sysname =~ "HP " ]] || [[ $sysname =~ LaserJet ]];then
+                            prmake="HP"
+                            model="${model##*:}"
+                            # some models of HP have the mac at .1.3.6.1.2.1.2.2.1.6.1 (3600,4200,4300) most others are at .1.3.6.1.2.1.2.2.1.6.2 (400,3010)
+                            [[ -z $macaddr ]] && macaddr="$(snmpget -v 1 -Ov -OQ -c public $oneprinter .1.3.6.1.2.1.2.2.1.6.2 2>/dev/null)"
+                            # the serial number for some HPs is not in the standard location, but it always seems to be here, but hex encoded
+                            hexserial="$(snmpget -v 1 -Ov -OQ -c public $oneprinter .1.3.6.1.4.1.11.2.3.9.4.2.1.1.3.3.0 2>/dev/null)"
+                            unset hexstring
+                            for hex in $hexserial;do
+                                if [[ $hex =~ ^[2-7][0-9A-Fa-f]$ ]];then
+                                    [[ $hex =~ ^7[fF]$ ]] && continue
+                                    [[ -z $hexstring ]] && hexstring="0x$hex" || hexstring="$hexstring 0x$hex"
+                                fi
+                            done
+                            serial="$(echo "$hexstring"|xxd -r)"
+                            found="yes"
+                        elif [[ $sysname =~ SHARP ]];then
+                            prmake="Sharp"
+                        elif [[ $sysname =~ KYOCERA ]];then
+                            prmake="Kyocera"
+                        elif [[ $sysname =~ Zebra ]];then
+                            prmake="Zebra"
+                            serial="$(snmpget -v 1 -Ov -OQ -c public $oneprinter .1.3.6.1.2.1.1.5.0 2>/dev/null)"
+                            # zebra sometimes uses 2nd, the 1st one may be completely bogus, but look somewhat "real" - ie. 0:0:0:80:96:98 - wtf
+                            if [[ $macaddr =~ [:]{2,} ]] || [[ -z $macaddr ]] || [[ $macaddr =~ ^0:0:0: ]];then
+                                macaddr="$(snmpget -v 1 -Ov -OQ -c public $oneprinter .1.3.6.1.2.1.2.2.1.6.2 2>/dev/null)"
+                            fi
+                            # real model is not in snmp that I can find, so some ugly stuff here
+                            [[ -f proutput2.$$ ]] && /bin/rm -f proutput2.$$
+                            curl -s -L -k --connect-timeout 5 -m 10 -o proutput2.$$ http://$oneprinter/server/CFGPAGE.htm
+                            if [[ -s proutput2.$$ ]];then
+                                dos2unix -q proutput2.$$
+                                # bad html from zebra has binary in it, l2c
+                                model="$(strings proutput2.$$|grep 'Connected To:')"
+                                model="${model##*- }"
+                                # serial number is the default sysname and can be changed by users, so this is preferred
+                                serial="$(strings proutput2.$$|grep 'Serial Number:'|awk '{print $NF}')"
+                            fi
+                            found="yes"
+                        elif [[ $sysname =~ PocketPro ]];then
+                            prmake="Zebra"
+                            curl -s -L -k --connect-timeout 5 -m 10 -o proutput2.$$ http://$oneprinter/CFGPAGE.htm
+                            if [[ -s proutput2.$$ ]];then
+                                dos2unix -q proutput2.$$
+                                model="$(strings proutput2.$$|grep 'Connected To:')"
+                                model="${model##*- }"
+                                if [[ -z $serial ]];then
+                                    serial="$(strings proutput2.$$|grep 'Serial Number:'|awk '{print $NF}')"
+                                fi
+                            fi
+                        elif [[ $sysname =~ OkiLAN ]] || [[ $sysname =~ OKI ]];then
+                            prmake="OkiData"
+                            curl -s -L -k --connect-timeout 5 -m 10 -o proutput2.$$ http://$oneprinter/cfgpage.hti
+                            if [[ -s proutput2.$$ ]];then
+                                dos2unix -q proutput2.$$
+                                if [[ -z $model ]] || [[ $model == "Unknown" ]];then
+                                    # strings may not be necessary for oki, but I'm not taking chances after zebra experience
+                                    model="$(strings proutput2.$$|grep 'Connected to:'|sed 's/^[^:]*: *//;s/ *$//')"
+                                fi
+                                if [[ $macaddr == "Unknown" ]] || [[ -z $macaddr ]];then
+                                    macaddr="$(strings proutput2.$$|grep 'Ethernet Address:'|sed 's/^[^:]*: *\([-0-9A-Fa-f]*\) .*$/\1/;s/-/:/g')"
+                                fi
+                                serial="$(strings proutput2.$$|grep 'Serial Number:'|awk '{print $NF}')"
+                            fi
+                        elif [[ $sysname =~ D-Link ]];then
+                            prmake="$sysname"
+                            model="D-link connected printer"
+                        # insert other makes as another elif here
+                        fi
+                    elif [[ $? -eq 1 ]];then
+                        model="No snmp, probably not a printer"
+                        echo "$oneprinter,$model" >/tmp/issues.$$
+                        continue
+                    elif [[ $? -eq 2 ]];then
+                        model="No such MIB .1.3.6.1.2.1.1.1.0 (sysname.0)" 
+                        echo "$oneprinter,$model" >/tmp/issues.$$
+                        continue
+                    fi
+                    # some printers do not support snmp, or have snmp turned off, we still need to find them?
+                    #if [[ $found != "yes" ]];then
+                    #    [[ -f proutput.$$ ]] && /bin/rm -f proutput.$$
+                    #    curl -s -L -k --connect-timeout 5 -m 10 -o proutput.$$ http://$oneprinter/
+                    #    if [[ -s proutput.$$ ]];then
+                    #        insert code here to find ino about this printer
+                    # convert ip to branch number - note that this works on our network because
+                    #                               I designed it to be a mathmatically sensible,
+                    #                               this will not work for most, who will need some
+                    #                               sort of cross-reference lookup instead
+                    # get branch from IP, non-branch address on 172.16/12 or 192.168/16
+                    if ! [[ $oneprinter =~ ^10\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]];then
+                        branch="Not a branch"
+                        building="Unknown building"
+                    elif [[ $oct2 =~ ^[0-9]{1,3}$ ]] && [[ $oct3 =~ ^[0-9]{1,3}$ ]];then
+                        if [[ $oct2 -eq 0 ]] && [[ $oct3 -lt 32 ]];then
+                            branch="Corporate"
+                            if [[ $oct3 -lt 8 ]];then
+                                building="Vikery buildings"
+                            elif [[ $oct3 -lt 16 ]];then
+                                building="Lipscomb"
+                            elif [[ $oct3 -lt 24 ]];then
+                                building="Water Garden"
+                            else
+                                building="Unknown"
+                            fi
+                        else
+                            if [[ $oct3 -eq 0 ]];then
+                                hundreds=0
+                                building="main building"
+                            else
+                                hundreds="$((oct3/32))"
+                                building="$((oct3%32))"
+                                if [[ $building -lt 8 ]];then
+                                    building="main building"
+                                elif [[ $building -lt 16 ]];then
+                                    building="2nd building"
+                                elif [[ $building -lt 24 ]];then
+                                    building="3rd building"
+                                else
+                                    building="Unknown"
+                                fi
+                            fi
+                            brnum="$(printf "%03d" "$(((hundreds*100)+oct2))")"
+                            branch="Br$brnum"
+                        fi
+                    else
+                        # check for non-branch locations
+                        branch="Unknown"
+                        building="Unknown"
+                    fi
+                    macaddr="${macaddr// /:}"
+                    macaddr="$(echo "$macaddr"|awk '{cnt=split($0,a,":");for(x=0;++x <= cnt;){while(length(a[x]) < 2){a[x]="0"a[x]}};m=sprintf("%s:%s:%s:%s:%s:%s",a[1],a[2],a[3],a[4],a[5],a[6]);print(tolower(m))}')"
+                    serial="${serial//\"/}"
+                    echo "$branch,$building,$oneprinter,$serial,$macaddr,$prmake,$model" >>$outfile
+                done
+                echo
+                #[[ -z $octets3 ]] && octets3="$oct3" ||octets3="$octets3,$oct3"
+            fi
+        done
+    done
+done
+[[ -s /tmp/issues.$$ ]] && cat /tmp/issues.$$
